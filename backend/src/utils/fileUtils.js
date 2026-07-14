@@ -1,9 +1,24 @@
+/**
+ * FILE EXPLANATION:
+ * This file contains utility helper functions for interacting with the local filesystem (I/O).
+ * It encapsulates operations like checking if folders exist, reading/writing files as buffers,
+ * cleaning up directories, and calculating folder metrics (total size and file count).
+ */
+
+// KEYWORDS EXPLANATION:
+// - "fs": Node.js core library used to interact with the file system.
+// - "Sync" suffix (e.g., writeFileSync, readFileSync): Synchronous functions that block thread execution until completed.
+// - "Buffer": A raw binary memory allocation class in Node.js used to read/write streamable file contents.
+// - "path.join(...)": Combines multiple path segments into a unified path string, handling slashes based on the operating system (Windows vs Linux).
+// - "path.dirname(...)": Extracts the directory portion of a full filepath string.
+
 import fs from "fs";
 import path from "path";
 
 /**
- * Ensures that a directory exists, creating it recursively if not.
- * @param {string} dirPath 
+ * ensureDirExists(dirPath)
+ * Verifies if the directory path exists. If not, it creates it.
+ * - "recursive: true": Ensures all parent directories are created automatically.
  */
 export const ensureDirExists = (dirPath) => {
     if (!fs.existsSync(dirPath)) {
@@ -12,20 +27,22 @@ export const ensureDirExists = (dirPath) => {
 };
 
 /**
- * Calculates statistics for a given directory (total size in bytes, list of files, file count).
- * @param {string} dirPath 
- * @returns {object} { size: number, count: number, files: Array<{name: string, size: number}> }
+ * getDirectoryStats(dirPath)
+ * Iterates through all files inside a directory to calculate:
+ *   - The sum of file sizes in bytes.
+ *   - The count of active files.
+ *   - A list of objects detailing file metadata (name, size, and modified time).
  */
 export const getDirectoryStats = (dirPath) => {
     ensureDirExists(dirPath);
-    const files = fs.readdirSync(dirPath);
+    const files = fs.readdirSync(dirPath); // Read list of files
     let totalSize = 0;
     const fileList = [];
 
     for (const filename of files) {
         const filepath = path.join(dirPath, filename);
         try {
-            const stats = fs.statSync(filepath);
+            const stats = fs.statSync(filepath); // Fetch file descriptors
             if (stats.isFile()) {
                 totalSize += stats.size;
                 fileList.push({
@@ -47,8 +64,9 @@ export const getDirectoryStats = (dirPath) => {
 };
 
 /**
- * Clears all files in a directory (leaving the folder itself).
- * @param {string} dirPath 
+ * clearDirectory(dirPath)
+ * Traverses a folder and deletes every file found inside it, leaving the root folder empty.
+ * - "fs.unlinkSync()": Deletes file path resource.
  */
 export const clearDirectory = (dirPath) => {
     if (!fs.existsSync(dirPath)) return;
@@ -57,7 +75,7 @@ export const clearDirectory = (dirPath) => {
         const filepath = path.join(dirPath, filename);
         try {
             if (fs.statSync(filepath).isFile()) {
-                fs.unlinkSync(filepath);
+                fs.unlinkSync(filepath); // Delete file resource
             }
         } catch (err) {
             console.error(`Error deleting file ${filename}:`, err);
@@ -66,9 +84,8 @@ export const clearDirectory = (dirPath) => {
 };
 
 /**
- * Saves a buffer to a file.
- * @param {string} filepath 
- * @param {Buffer} buffer 
+ * saveFile(filepath, buffer)
+ * Writes raw binary buffer contents to a specified file.
  */
 export const saveFile = (filepath, buffer) => {
     ensureDirExists(path.dirname(filepath));
@@ -76,9 +93,8 @@ export const saveFile = (filepath, buffer) => {
 };
 
 /**
- * Reads a file as buffer. Returns null if not exists.
- * @param {string} filepath 
- * @returns {Buffer|null}
+ * readFile(filepath)
+ * Reads file binary contents as a buffer. Returns null if the file doesn't exist.
  */
 export const readFile = (filepath) => {
     if (fs.existsSync(filepath)) {

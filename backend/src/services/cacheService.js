@@ -1,3 +1,20 @@
+/**
+ * FILE EXPLANATION:
+ * This file coordinates caching workflows, tracking request statistics (HIT, MISS, BLOOM_REJECT),
+ * saving/reading files from local disk, and implementing cache cleanups.
+ * It enforces two caching policies:
+ *   1. Time-to-Live (TTL): Evicts files older than a threshold.
+ *   2. Least Recently Used (LRU): Evicts files accessed longest ago if the storage folder exceeds size limits.
+ */
+
+// KEYWORDS EXPLANATION:
+// - "export const": Standard ES Modules export syntax, allowing multiple exports in a single file.
+// - "setInterval()": Node.js function scheduling a callback function to run repeatedly at fixed millisecond delays.
+// - "fs.utimesSync()": Updates the file's access time (atime) and modification time (mtime). We touch these dates to track file access history.
+// - "fs.unlinkSync()": Synchronously deletes a file.
+// - "Array.prototype.sort()": Standard array sort. We compare date values to order files oldest-first.
+// - "path.resolve()": Combines path segments into an absolute path.
+
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
@@ -12,20 +29,24 @@ const _dirname = path.dirname(_filename);
 // Target cache folder path: backend/cache
 const CACHE_DIR = path.resolve(_dirname, "../../cache");
 
-// Initialize a Bloom Filter (e.g., m = 1000, k = 4)
+// Initialize the Bloom Filter singleton (e.g., bit array of 1000, 4 hash functions)
 const bloomFilter = new BloomFilter(1000, 4);
 
-// Metrics tracker for the application
+// Metrics tracker holding real-time statistics
 export const metrics = {
     totalRequests: 0,
     cacheHits: 0,
     cacheMisses: 0,
     bloomRejections: 0,
-    logs: [] // Historic request logs: { timestamp, filename, status, latency }
+    logs: [] // Holds last 50 request descriptors: { timestamp, filename, status, latency }
 };
 
 /**
- * Log an event to the metrics log
+ * logRequest(filename, status, latency)
+ * Logs a request event and increments the matching metric counter.
+ * @param {string} filename 
+ * @param {string} status - "HIT", "MISS", "BLOOM_REJECT"
+ * @param {number} latency - duration in ms
  */
 export const logRequest = (filename, status, latency) => {
     metrics.totalRequests++;
@@ -33,6 +54,7 @@ export const logRequest = (filename, status, latency) => {
     else if (status === "MISS") metrics.cacheMisses++;
     else if (status === "BLOOM_REJECT") metrics.bloomRejections++;
 
+    // Add request record to the start of log history
     metrics.logs.unshift({
         timestamp: new Date().toISOString(),
         filename,
@@ -40,25 +62,26 @@ export const logRequest = (filename, status, latency) => {
         latency
     });
 
-    // Limit log history to last 50 entries
+    // Enforce history size cap (keep only the 50 most recent logs)
     if (metrics.logs.length > 50) {
         metrics.logs.pop();
     }
 };
 
 /**
- * Initializes the Bloom Filter by querying the origin server's file list.
+ * initializeBloomFilter()
+ * Fetches all filenames from the origin server to initialize the Bloom Filter.
  */
 export const initializeBloomFilter = async () => {
     console.log("Initializing Bloom Filter from Origin...");
     
-    // Ensure cache directory exists at startup
+    // Create cache directory if it doesn't exist
     fileUtils.ensureDirExists(CACHE_DIR);
 
-    // Fetch existing files from origin
+    // Fetch the list of file names
     const files = await fetchFilesList();
     
-    // Clear and populate Bloom Filter
+    // Empty the Bloom Filter and load the retrieved files
     bloomFilter.clear();
     for (const filename of files) {
         console.log(`Adding to Bloom Filter: ${filename}`);
@@ -69,20 +92,21 @@ export const initializeBloomFilter = async () => {
 };
 
 /**
- * Checks if a file exists in the local cache.
+ * isCached(filename)
+ * Verifies if the file exists on the local caching disk.
  * @param {string} filename 
  * @returns {boolean}
  */
 export const isCached = (filename) => {
-    // Sanitize filename to avoid path traversal vulnerabilities
     const safeFilename = path.basename(filename);
     const filepath = path.join(CACHE_DIR, safeFilename);
     return fs.existsSync(filepath);
 };
 
 /**
- * Reads a cached file.
- * Updates its modification (mtime) and access (atime) times on every hit to enable Least Recently Used (LRU) tracking.
+ * getCachedFile(filename)
+ * Reads the cached file and updates its modified date (touching it)
+ * to indicate a fresh access, which prevents it from being evicted by LRU.
  * @param {string} filename 
  * @returns {{ data: Buffer, filepath: string } | null}
  */
@@ -90,7 +114,7 @@ export const getCachedFile = (filename) => {
     const safeFilename = path.basename(filename);
     const filepath = path.join(CACHE_DIR, safeFilename);
     if (fs.existsSync(filepath)) {
-        // Touch file times: updates both access time (atime) and modify time (mtime) to now
+        // Touch file times: updates access time (atime) and modify time (mtime) to now
         const now = new Date();
         try {
             fs.utimesSync(filepath, now, now);
@@ -104,8 +128,8 @@ export const getCachedFile = (filename) => {
 };
 
 /**
- * Saves a file to the cache directory.
- * Automatically runs cache checks to enforce eviction policies.
+ * saveCachedFile(filename, buffer)
+ * Saves a file buffer locally and runs the eviction sweep.
  * @param {string} filename 
  * @param {Buffer} buffer 
  */
@@ -119,9 +143,10 @@ export const saveCachedFile = (filename, buffer) => {
 };
 
 /**
- * Uses the Bloom Filter to check if a file probably exists on the origin.
+ * checkBloomFilter(filename)
+ * Tests if the filename exists in the Bloom Filter.
  * @param {string} filename 
- * @returns {boolean} false if definitely not on origin, true if probably on origin
+ * @returns {boolean} false if definitely not present, true if probably present
  */
 export const checkBloomFilter = (filename) => {
     const safeFilename = path.basename(filename);
@@ -129,7 +154,8 @@ export const checkBloomFilter = (filename) => {
 };
 
 /**
- * Manually add a file name to the Bloom Filter (e.g. when a file is uploaded).
+ * registerNewFile(filename)
+ * Inserts a filename into the Bloom Filter dynamically (called on fresh uploads).
  * @param {string} filename 
  */
 export const registerNewFile = (filename) => {
@@ -139,7 +165,8 @@ export const registerNewFile = (filename) => {
 };
 
 /**
- * Wipes out the local cache directory.
+ * flushCache()
+ * Clears the local disk cache folder entirely.
  */
 export const flushCache = () => {
     fileUtils.clearDirectory(CACHE_DIR);
@@ -147,13 +174,13 @@ export const flushCache = () => {
 };
 
 /**
- * Retrieves cache metrics (size, file count, hit rate, and filter stats).
- * @returns {object} Cache stats
+ * getCacheStats()
+ * Prepares system metrics and history logs to display on the dashboard UI.
  */
 export const getCacheStats = () => {
     const dirStats = fileUtils.getDirectoryStats(CACHE_DIR);
     
-    // Calculate hit rate
+    // Calculate percentage cache hit rate
     const hitRate = metrics.totalRequests > 0 
         ? ((metrics.cacheHits / metrics.totalRequests) * 100).toFixed(1)
         : 0;
@@ -174,7 +201,11 @@ export const getCacheStats = () => {
 };
 
 /**
- * Periodically scans the cache folder and deletes expired or LRU files.
+ * enforceCachePolicies()
+ * Triggered periodically. It scans all cached files and:
+ *   1. Deletes expired files (older than CACHE_TTL_SEC).
+ *   2. If total size exceeds CACHE_MAX_SIZE_MB, sorts active files by 
+ *      touch date (oldest first) and evicts files until size is within threshold (LRU).
  */
 export const enforceCachePolicies = () => {
     try {
@@ -184,14 +215,14 @@ export const enforceCachePolicies = () => {
 
         const now = new Date();
         
-        // Load TTL and size limit from env configs, fallback if undefined
+        // Load configurations with safety fallbacks
         const cacheTtlMs = (parseInt(env.CACHE_TTL_SEC, 10) || 300) * 1000;
         const cacheMaxSizeBytes = (parseInt(env.CACHE_MAX_SIZE_MB, 10) || 10) * 1024 * 1024;
 
         let totalCurrentSize = 0;
         const activeFiles = [];
 
-        // 1. Enforce TTL: Delete files that haven't been touched in TTL seconds
+        // 1. Evict based on Time-To-Live (TTL)
         for (const file of filesList) {
             const filepath = path.join(CACHE_DIR, file.name);
             const ageMs = now - new Date(file.mtime);
@@ -205,19 +236,19 @@ export const enforceCachePolicies = () => {
                 }
             } else {
                 totalCurrentSize += file.size;
-                activeFiles.push(file);
+                activeFiles.push(file); // File is active
             }
         }
 
-        // 2. Enforce LRU: Evict oldest accessed files if size limit is exceeded
+        // 2. Evict based on Least Recently Used (LRU)
         if (totalCurrentSize > cacheMaxSizeBytes) {
-            console.log(`[Cache LRU Eviction] Cache size (${(totalCurrentSize / 1024).toFixed(1)} KB) exceeds limit (${(cacheMaxSizeBytes / 1024).toFixed(1)} KB). Evicting files...`);
+            console.log(`[Cache LRU Eviction] Cache size (${(totalCurrentSize / 1024).toFixed(1)} KB) exceeds limit (${(cacheMaxSizeBytes / 1024).toFixed(1)} KB). Evicting...`);
             
-            // Sort by modified/touch time ascending (oldest first)
+            // Sort active files oldest-first by comparing modification/touch times
             activeFiles.sort((a, b) => new Date(a.mtime) - new Date(b.mtime));
 
             for (const file of activeFiles) {
-                if (totalCurrentSize <= cacheMaxSizeBytes) break;
+                if (totalCurrentSize <= cacheMaxSizeBytes) break; // Size is within threshold
 
                 const filepath = path.join(CACHE_DIR, file.name);
                 console.log(`[Cache LRU Eviction] Evicting least recently used file "${file.name}" (${(file.size / 1024).toFixed(1)} KB)`);
@@ -234,5 +265,5 @@ export const enforceCachePolicies = () => {
     }
 };
 
-// Background Cache Eviction thread: check every 10 seconds
+// Start a background thread running the cache policy check loop every 10 seconds
 setInterval(enforceCachePolicies, 10000);

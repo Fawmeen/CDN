@@ -1,3 +1,22 @@
+/**
+ * FILE EXPLANATION:
+ * This file bootstraps and runs the Origin Server (default port 9000).
+ * The Origin Server is the absolute source of truth for assets in this microservices setup.
+ * It provides APIs to:
+ *   - List all files stored in the database.
+ *   - Upload new files directly into MySQL (as raw binary data).
+ *   - Fetch and download files by name (queried on CDN cache misses).
+ */
+
+// KEYWORDS EXPLANATION:
+// - "multer.memoryStorage()": Instructs Multer to store uploaded file buffers in memory (RAM)
+//   as Buffer objects rather than writing temporary files to the disk. This speeds up transfer to MySQL.
+// - "ON DUPLICATE KEY UPDATE": SQL upsert syntax. If a record with a unique key (filename) already exists,
+//   it updates the existing record details instead of throwing an error.
+// - "LONGBLOB": MySQL data type that can hold up to 4GB of raw binary data.
+// - "res.sendStatus()": Express method to immediately set the HTTP status and send its text representation (e.g. 200 OK).
+// - "regex.replace()": A utility string method to clean inputs. Here it deletes special path/shell injection characters.
+
 import express from "express";
 import path from "path";
 import multer from "multer";
@@ -6,18 +25,17 @@ import { getDbPool, initializeDatabase } from "./config/db.js";
 
 const originExpressApp = express();
 
-// Multer middleware: configured to store uploaded file buffers in memory (RAM) 
-// instead of writing temp files to disk, allowing fast transfers directly to MySQL.
+// Configure Multer storage engine in memory
 const memoryStorage = multer.memoryStorage();
 const uploadMiddleware = multer({ 
     storage: memoryStorage,
-    limits: { fileSize: 10 * 1024 * 1024 } // Enforce a 10MB maximum file size limit
+    limits: { fileSize: 10 * 1024 * 1024 } // Limit files to 10MB
 });
 
-// Configure JSON body parser middleware
+// Parse incoming HTTP requests with JSON payloads
 originExpressApp.use(express.json());
 
-// Set up CORS headers allowing cross-origin requests from the React client on port 5173
+// Enable CORS middleware for the origin endpoints
 originExpressApp.use((req, res, next) => {
     res.header("Access-Control-Allow-Origin", "*");
     res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -30,14 +48,15 @@ originExpressApp.use((req, res, next) => {
 
 /**
  * GET /api/files
- * Retrieves the metadata details of all assets stored in the MySQL database.
- * Used by the CDN on startup to load keys into the Bloom Filter.
+ * Returns a list of filenames and metadata (size, upload timestamp).
+ * Used at startup by the edge cache to populate its Bloom Filter.
  */
 originExpressApp.get("/api/files", async (req, res) => {
     try {
         const dbConnectionPool = getDbPool();
         
-        // Query only filename, size, and modified timestamp (uploaded_at) to avoid pulling heavy binary content
+        // Query database files.
+        // We select only metadata (name, size, timestamp) and omit the large 'content' binary column to save network and RAM overhead.
         const [fileRows] = await dbConnectionPool.query(
             "SELECT name, size, uploaded_at as mtime FROM origin_files ORDER BY uploaded_at DESC"
         );
@@ -58,22 +77,23 @@ originExpressApp.get("/api/files", async (req, res) => {
 
 /**
  * POST /api/upload
- * Endpoint to upload a new asset directly into the database.
- * The file is registered as a row containing name, size, binary content, and MIME type.
+ * Saves a file's binary content directly inside the MySQL database as a LONGBLOB.
+ * Uses upsert SQL command (overwrites file if it already exists).
  */
 originExpressApp.post("/api/upload", uploadMiddleware.single("file"), async (req, res) => {
     if (!req.file) {
         return res.status(400).json({ error: "No file was selected for upload" });
     }
 
-    // Sanitize the original filename to prevent directory traversal or malicious injection
+    // Sanitize filename:
+    // 1. path.basename removes directory traversal elements (e.g. '../../file.txt' -> 'file.txt')
+    // 2. regex replace strips out characters that are not letters, digits, dots, hyphens, or underscores.
     const safeFilename = path.basename(req.file.originalname).replace(/[^a-zA-Z0-9.\-_]/g, "");
 
     try {
         const dbConnectionPool = getDbPool();
         
-        // Save the file parameters and raw buffer directly into the database
-        // If a file with the same name already exists, overwrite it (upsert)
+        // Execute SQL command with placeholder params ('?') to prevent SQL injections
         await dbConnectionPool.query(
             `INSERT INTO origin_files (name, size, content, mime_type) VALUES (?, ?, ?, ?)
              ON DUPLICATE KEY UPDATE size = VALUES(size), content = VALUES(content), mime_type = VALUES(mime_type)`,
@@ -95,8 +115,8 @@ originExpressApp.post("/api/upload", uploadMiddleware.single("file"), async (req
 
 /**
  * GET /:filename
- * Serves a file's binary stream directly out of the MySQL database.
- * Queried by the CDN Cache server on cache misses.
+ * Serves a file's raw binary buffer from the database with the correct MIME type header.
+ * Queried by the Edge Cache Server on cache misses.
  */
 originExpressApp.get("/:filename", async (req, res) => {
     const requestedFilename = req.params.filename;
@@ -109,13 +129,13 @@ originExpressApp.get("/:filename", async (req, res) => {
     try {
         const dbConnectionPool = getDbPool();
         
-        // Retrieve the MIME type and content buffer for the requested file
+        // Select binary content and MIME type matching the safe name parameter
         const [fileRecordRows] = await dbConnectionPool.query(
             "SELECT content, mime_type FROM origin_files WHERE name = ?", 
             [safeFilename]
         );
 
-        // If no rows match, the file does not exist in the database
+        // Return a 404 if no record matches
         if (fileRecordRows.length === 0) {
             console.warn(`Origin Server Database: Requested file "${safeFilename}" not found.`);
             return res.status(404).send("File not found");
@@ -123,19 +143,24 @@ originExpressApp.get("/:filename", async (req, res) => {
 
         const matchedFileRecord = fileRecordRows[0];
         
-        // Stream the binary buffer back to the CDN with its corresponding Content-Type
+        // Write standard Content-Type header so client browser renders binary data correctly
         res.setHeader("Content-Type", matchedFileRecord.mime_type || "application/octet-stream");
-        return res.send(matchedFileRecord.content);
+        return res.send(matchedFileRecord.content); // Sends raw binary buffer
     } catch (err) {
         console.error(`Error serving file "${safeFilename}" from database:`, err);
         res.status(500).json({ error: "Failed to fetch file from origin database" });
     }
 });
 
-// Main startup function for the origin application server
+/**
+ * startOriginServer()
+ * Boots the Origin server by:
+ *   1. Verifying MySQL database and tables exist.
+ *   2. Binding the Express listener port.
+ */
 const startOriginServer = async () => {
     try {
-        // Run database existence check and compile table schemas
+        // Run database schemas initialization script
         await initializeDatabase();
 
         originExpressApp.listen(env.ORIGIN_PORT, () => {

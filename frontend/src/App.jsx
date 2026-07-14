@@ -518,7 +518,7 @@ export default function App() {
         <div className="glow-sphere glow-2"></div>
       </div>
 
-      <Header />
+      <Header cdnPort={5001} />
 
       <main className="dashboard-grid">
         <div className="panel sidebar" style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
