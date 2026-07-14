@@ -10,7 +10,7 @@
  * Uses native Node.js fetch (Node 18+) so it requires no external npm dependencies to run.
  */
 
-const EDGE_CACHE_URL = process.env.EDGE_CACHE_URL || "http://localhost:5001";
+const EDGE_CACHE_URL = process.env.EDGE_CACHE_URL || "http://127.0.0.1:5001";
 const CONCURRENT_REQUESTS = 100;
 
 // Color helpers for clean terminal output
