@@ -1,0 +1,92 @@
+========================================================================
+                 EDGE CACHE CDN - PERFORMANCE & LATENCY ANALYTICS
+========================================================================
+Date/Timestamp          : 2026-07-14 20:24:29
+Target CDN Edge Server  : http://127.0.0.1:5001
+Concurrent Load Volume  : 100 requests
+Test Asset Seed Name    : benchmark_test_1784040797874.txt
+
+------------------------------------------------------------------------
+1. BENCHMARK EXECUTION LATENCY METRICS
+------------------------------------------------------------------------
+Single Cache MISS Latency : Client: 38.57 ms | Server internal: 30.37 ms   
+
+CLIENT-SIDE ROUNDTRIP LATENCY (Includes WSL2 Network Hop Overhead):
+---------------------------------------------------------------------------------------------------
+Scenario             |      Min    |      Avg    | p50 (Med) |      p95    |      p99    |      Max
+---------------------------------------------------------------------------------------------------
+Cache HIT (Disk)     |   203.00 ms |   971.51 ms |   986.03 ms |  1599.34 ms |  1664.50 ms |  1680.08 ms
+Bloom Reject (Guard) |    85.70 ms |   179.36 ms |   167.45 ms |   279.55 ms |   286.56 ms |   287.76 ms
+---------------------------------------------------------------------------------------------------
+
+SERVER-SIDE INTERNAL PROCESSING LATENCY (Pure Server Execution Time):      
+---------------------------------------------------------------------------------------------------
+Scenario             |      Min    |      Avg    | p50 (Med) |      p95    |      p99    |      Max
+---------------------------------------------------------------------------------------------------
+Cache HIT (Disk)     |     7.75 ms |    12.80 ms |    11.55 ms |    16.76 ms |    48.47 ms |    48.49 ms
+Bloom Reject (Guard) |     0.62 ms |     0.86 ms |     0.82 ms |     1.12 ms |     1.32 ms |     1.56 ms
+---------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------
+2. DETAILED PERFORMANCE ANALYSIS
+------------------------------------------------------------------------
+
+I. Bloom Filter Efficiency (The Guard Layer)
+--------------------------------------------
+- Average Server Latency: 0.86 ms
+- Worst-Case Server Latency (Max): 1.56 ms (under 100 concurrent requests)
+- Performance Speedup: ~35.3x faster than a Cache Miss
+
+Analysis:
+The Bloom Filter functions as an anti-cache-penetration guard at the Edge Cache.
+When requests for non-existent files are received, the Bloom Filter instantly blocks
+them in under 1 ms, preventing a network round-trip request to the Origin server
+and avoiding a database check. By serving rejections in 0.86 ms instead of the 30.37 ms
+required for a Cache Miss database lookup, the system processes requests 3,500%
+faster. This prevents database resource exhaustion under high request volume or
+malicious search attacks.
+
+
+II. Caching Performance (Disk HIT vs. DB MISS)
+----------------------------------------------
+- Cache HIT (Disk): 12.80 ms
+- Cache MISS (Database Lookup at Origin): 30.37 ms
+- Performance Speedup: ~2.37x faster than database queries
+
+Analysis:
+Serving cached assets directly from the local disk of the CDN Edge node is more than
+twice as fast as fetching them from the origin server's MySQL database.
+However, under a concurrent load of 100 requests, a minor Disk I/O bottleneck
+becomes visible: while the minimum cache hit time is 7.75 ms, the worst-case (Max)
+spikes to 48.49 ms (p99 is 48.47 ms). Node's filesystem reading threads are blocked
+waiting on disk operations.
+To scale this caching proxy to thousands of concurrent requests, replacing local disk
+caching with an in-memory Redis caching store is recommended to achieve sub-millisecond
+hit latencies under high concurrency.
+
+
+III. Network & WSL2 Virtualization Overhead
+-------------------------------------------
+Analysis:
+There is a significant difference between Client-side roundtrip latency (971.51 ms Avg)
+and Server-side internal processing latency (12.80 ms Avg) for Cache Hits.
+This overhead is caused by:
+1. Docker WSL2 VM Network Bridge: On Windows, Docker containers run inside a WSL2
+   Linux virtual machine. Requests sent from the Windows host must cross the host-to-VM
+   boundary and be routed through Docker's internal networking layer, creating routing
+   queues under concurrent bursts.
+2. Connection Pooling: Node's native fetch handler queues concurrent connections to a
+   single host, adding client-side delay.
+The Server-Side Internal Processing Latency isolates this network bridge lag, proving
+that the backend server code executes cache hits in 12.80 ms and bloom rejects in 0.86 ms.
+
+
+------------------------------------------------------------------------
+3. RECOMMENDATIONS & NEXT STEPS
+------------------------------------------------------------------------
+1. Integrate Redis in-memory Caching (Option 1):
+   Replace file reads/writes with a Redis database container to resolve the disk I/O
+   bottleneck under high concurrent loads.
+2. Implement Real-Time Bloom Filter Sync via Redis Pub/Sub (Option 2):
+   Automatically synchronize file additions between the Origin Database Server and
+   multiple CDN Edge Cache nodes in real-time.
